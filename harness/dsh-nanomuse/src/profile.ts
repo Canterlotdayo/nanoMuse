@@ -22,7 +22,7 @@ import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promise
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { SharedConnector } from './desk.ts'
-import type { ProfileClip, Relay, RelayProfile } from './relay.ts'
+import type { ProfileClip, ProfileOwnClip, Relay, RelayProfile } from './relay.ts'
 
 // ---- the package's own files ---------------------------------------------------------
 
@@ -97,6 +97,18 @@ export class ProfileStore {
     return p.avatar === 'face' && this.clips && this.clips.faceId === p.faceId ? this.clips.clips : undefined
   }
 
+  private ownClips: Record<string, ProfileOwnClip> | null | undefined = undefined
+
+  /** The account's own clips as last seen (a write of this device, or a pull). */
+  accountOwnClips(): Record<string, ProfileOwnClip> | null {
+    return this.ownClips === undefined ? null : this.ownClips
+  }
+
+  /** The account listed these own clips (a write of this device's own, or a pull). */
+  rememberOwnClips(ownClips: Record<string, ProfileOwnClip> | null): void {
+    this.ownClips = ownClips
+  }
+
   /** The account listed these clips (a write of this device's own, or a pull): kept for `accountClips`. */
   rememberClips(faceId: string, clips: Record<string, ProfileClip> | undefined): void {
     this.clips = faceId && clips ? { faceId, clips } : undefined
@@ -159,6 +171,7 @@ export class ProfileStore {
     }
     // the clips go with the face: another look, or a face without them, forgets what was listed
     this.rememberClips(next.faceId, next.avatar === 'face' ? light.clips : undefined)
+    this.rememberOwnClips(light.own_clips ?? null)
     await this.wear(next)
     return true
   }

@@ -163,6 +163,8 @@ export interface ProfileWrite {
   device_id?: string
   /** The drawn face's clips as files this account put up (relay 0.29); `null` clears them. Absent keeps what is stored. */
   clips?: Record<string, ProfileClip> | null
+  /** The person's own clips (one per mood, with an optional poster); `null` clears them. Absent keeps what is stored. */
+  own_clips?: Record<string, ProfileOwnClip> | null
 }
 
 /** One clip of the drawn face in the account's profile: a file at `GET /v1/blobs/{sha256}`. */
@@ -170,6 +172,14 @@ export interface ProfileClip {
   sha256: string
   mime: string
   bytes: number
+}
+
+/** One of the person's own clips (own_clips) in the account's profile: a video and an optional poster, both at `GET /v1/blobs/{sha256}`. */
+export interface ProfileOwnClip {
+  sha256: string
+  mime: string
+  bytes: number
+  poster?: { sha256: string; mime: string; bytes: number }
 }
 
 /** What a few pictures would cost next to what is left today (`GET /v1/estimate`). */
@@ -211,6 +221,8 @@ export interface RelayProfile {
   connectors: SharedConnector[]
   /** The face's clips another device made (relay 0.29), by mood; absent when there are none. */
   clips?: Record<string, ProfileClip>
+  /** The person's own clips (relay 0.29+), by mood, with optional poster. */
+  own_clips?: Record<string, ProfileOwnClip> | null
 }
 
 const JSON_HEADERS = { 'content-type': 'application/json' }
@@ -240,6 +252,29 @@ export function readProfileClips(raw: unknown): Record<string, ProfileClip> | un
     out[mood] = { sha256, mime: String(c.mime ?? ''), bytes: typeof c.bytes === 'number' ? c.bytes : 0 }
   }
   return Object.keys(out).length ? out : undefined
+}
+
+/** `{mood: {sha256, mime, bytes, poster?}}` as the relay sends it for `own_clips`; entries that are not a hex SHA-256 are left out. */
+export function readProfileOwnClips(raw: unknown): Record<string, ProfileOwnClip> | null | undefined {
+  if (raw === null) return null
+  if (!raw || typeof raw !== 'object') return undefined
+  const out: Record<string, ProfileOwnClip> = {}
+  for (const [mood, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!v || typeof v !== 'object') continue
+    const c = v as Record<string, unknown>
+    const sha256 = String(c.sha256 ?? '').toLowerCase()
+    if (!/^[0-9a-f]{64}$/.test(sha256)) continue
+    const entry: ProfileOwnClip = { sha256, mime: String(c.mime ?? ''), bytes: typeof c.bytes === 'number' ? c.bytes : 0 }
+    if (c.poster && typeof c.poster === 'object') {
+      const p = c.poster as Record<string, unknown>
+      const psha = String(p.sha256 ?? '').toLowerCase()
+      if (/^[0-9a-f]{64}$/.test(psha)) {
+        entry.poster = { sha256: psha, mime: String(p.mime ?? ''), bytes: typeof p.bytes === 'number' ? p.bytes : 0 }
+      }
+    }
+    out[mood] = entry
+  }
+  return Object.keys(out).length ? out : null
 }
 
 function toDataControls(ct: unknown): DataControls | undefined {
@@ -400,6 +435,22 @@ export class Relay {
       method: 'PUT',
       headers: { ...this.auth(apiKey), ...JSON_HEADERS },
       body: JSON.stringify({ clips, device: device.slice(0, 80) }),
+      signal: signal ?? null,
+    })
+    if (!res.ok) await fail(res)
+    const out = (await res.json().catch(() => ({}))) as { rev?: number }
+    return Number(out.rev ?? 0)
+  }
+
+  /**
+   * Name the person's own clips in the account's profile alone (`PUT /v1/me/profile` with only `own_clips`):
+   * the relay replaces the stored map, keeps the rest of the profile, and other devices adopt these clips.
+   */
+  async putProfileOwnClips(apiKey: string, ownClips: Record<string, ProfileOwnClip>, device: string, signal?: AbortSignal): Promise<number> {
+    const res = await this.fetchImpl(`${this.origin}/v1/me/profile`, {
+      method: 'PUT',
+      headers: { ...this.auth(apiKey), ...JSON_HEADERS },
+      body: JSON.stringify({ own_clips: ownClips, device: device.slice(0, 80) }),
       signal: signal ?? null,
     })
     if (!res.ok) await fail(res)
@@ -591,6 +642,7 @@ export class Relay {
     const body = (await res.json()) as Record<string, unknown>
     const face = body.face && typeof body.face === 'object' ? (body.face as Record<string, unknown>) : undefined
     const clips = readProfileClips(body.clips)
+    const own_clips = readProfileOwnClips(body.own_clips)
     return {
       rev: Number(body.rev ?? 0),
       device: String(body.device ?? ''),
@@ -605,6 +657,7 @@ export class Relay {
       connectors: readSharedConnectors(body.connectors),
       ...(face ? { face: Object.fromEntries(Object.entries(face).filter(([, v]) => typeof v === 'string')) as Record<string, string> } : {}),
       ...(clips ? { clips } : {}),
+      ...(own_clips != null ? { own_clips } : {}),
     }
   }
 

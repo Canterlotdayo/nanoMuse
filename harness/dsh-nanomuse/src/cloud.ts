@@ -48,7 +48,7 @@ import { CODING_ACTIONS, CodingService, codingBrief, GATED_CODING_ACTIONS } from
 import { helloLlm, HubClient, HubError, type Caller, type HubDevice, type IncomingCall } from './hub.ts'
 import { ProfileStore, type Profile } from './profile.ts'
 import { cloudOffFailure, relayFailure, transportFailure, type RelayRefusal } from './refusals.ts'
-import { Relay, RelayError, type Account, type Estimate, type Invite, type ProfileWrite, type RelayModel, type SignIn } from './relay.ts'
+import { Relay, RelayError, type Account, type Estimate, type Invite, type ProfileOwnClip, type ProfileWrite, type RelayModel, type SignIn } from './relay.ts'
 import { homeWorkspace } from './home.ts'
 import { TaskRunner, textOf } from './task.ts'
 import { Turns, aggregateWork, type WorkItem } from './work.ts'
@@ -883,6 +883,7 @@ export default class NanomuseCloud extends Service {
     // old clips and, with the Media setting on and a video model at hand, is animated again.
     await this.motion.init().catch((error: unknown) => this.ctx.logger.warn('nanomuse: avatar clips not read: %s', message(error)))
     await this.ownClip.init().catch((error: unknown) => this.ctx.logger.warn('nanomuse: own clip not read: %s', message(error)))
+    this.adoptOwnClips().catch(() => undefined)
     this.profile.onChange(() => void this.animateNewFace().catch((error: unknown) => this.ctx.logger.warn('nanomuse: avatar motion: %s', message(error))))
     this.hub.onState(() => this.broadcast())
     this.hub.onDevices(() => this.broadcast())
@@ -4172,6 +4173,108 @@ export default class NanomuseCloud extends Service {
     res.on('close', done)
   }
 
+  // ---- own clips: sync with relay (push on use/clear, pull on sign-in) ---------------
+
+  /**
+   * Push all local own clips to the relay for other devices.
+   * Called after use/clear and on sign-in.
+   */
+  private async shareOwnClips(): Promise<void> {
+    const token = await this.token()
+    if (!token || !this.state.account) return
+    const view = this.ownClip.view()
+    const moods = this.ownClip.moods()
+    const ownClips: Record<string, ProfileOwnClip> = {}
+    // default clip
+    if (view) {
+      try {
+        const data = new Uint8Array(await readFile(this.ownClip.clipFile))
+        const sha256 = createHash('sha256').update(data).digest('hex')
+        if (!(await this.relay.hasBlob(token, sha256))) await this.relay.putBlob(token, sha256, 'video/mp4', data)
+        const entry: ProfileOwnClip = { sha256, mime: 'video/mp4', bytes: data.length }
+        // poster
+        try {
+          const poster = new Uint8Array(await readFile(this.ownClip.posterFile))
+          const psha = createHash('sha256').update(poster).digest('hex')
+          if (!(await this.relay.hasBlob(token, psha))) await this.relay.putBlob(token, psha, 'image/png', poster)
+          entry.poster = { sha256: psha, mime: 'image/png', bytes: poster.length }
+        } catch { /* no poster */ }
+        ownClips['default'] = entry
+      } catch { /* file gone */ }
+    }
+    // per-mood clips
+    for (const [mood, mv] of Object.entries(moods) as [OwnClipMood, OwnClipView][]) {
+      if (!mv) continue
+      try {
+        const moodPath = this.ownClip.moodClipFile(mood as OwnClipMood)
+        if (!moodPath) continue
+        const data = new Uint8Array(await readFile(moodPath))
+        const sha256 = createHash('sha256').update(data).digest('hex')
+        if (!(await this.relay.hasBlob(token, sha256))) await this.relay.putBlob(token, sha256, 'video/mp4', data)
+        const entry: ProfileOwnClip = { sha256, mime: 'video/mp4', bytes: data.length }
+        try {
+          const posterPath = this.ownClip.moodPosterFile(mood)
+          const poster = new Uint8Array(await readFile(posterPath))
+          const psha = createHash('sha256').update(poster).digest('hex')
+          if (!(await this.relay.hasBlob(token, psha))) await this.relay.putBlob(token, psha, 'image/png', poster)
+          entry.poster = { sha256: psha, mime: 'image/png', bytes: poster.length }
+        } catch { /* no poster */ }
+        ownClips[mood] = entry
+      } catch { /* file gone */ }
+    }
+    await this.relay.putProfileOwnClips(token, Object.keys(ownClips).length ? ownClips : {}, this.writerId())
+    this.profile.rememberOwnClips(ownClips)
+    this.ctx.logger.info('nanomuse: own clips: shared %d clip(s) with the relay', Object.keys(ownClips).length)
+  }
+
+  /**
+   * Pull own clips from the relay for moods this computer does not have locally.
+   * Called on sign-in and when the profile changes.
+   */
+  private async adoptOwnClips(): Promise<number> {
+    const token = await this.token()
+    if (!token) return 0
+    const listed = this.profile.accountOwnClips()
+    if (!listed) return 0
+    let adopted = 0
+    for (const [mood, clip] of Object.entries(listed)) {
+      // skip if already local
+      if (mood === 'default') {
+        if (this.ownClip.view()) continue
+      } else {
+        const mv = this.ownClip.moods()[mood as OwnClipMood]
+        if (mv) continue
+      }
+      try {
+        const { data } = await this.relay.getBlob(token, clip.sha256)
+        if (createHash('sha256').update(data).digest('hex') !== clip.sha256) continue
+        // write to the right path
+        const dir = join(this.ownClip.clipFile, '..')
+        await mkdir(dir, { recursive: true })
+        if (mood === 'default') {
+          await writeFile(this.ownClip.clipFile, data)
+        } else {
+          const moodPath = this.ownClip.moodClipFile(mood as OwnClipMood)
+          await writeFile(moodPath, data)
+        }
+        // poster
+        if (clip.poster) {
+          try {
+            const { data: pData } = await this.relay.getBlob(token, clip.poster.sha256)
+            const posterFile = mood === 'default' ? this.ownClip.posterFile : this.ownClip.moodPosterFile(mood as OwnClipMood)
+            await writeFile(posterFile, pData)
+          } catch { /* no poster */ }
+        }
+        await this.ownClip.rescan()
+        adopted++
+      } catch { /* blob gone */ }
+    }
+    if (adopted) this.ctx.logger.info('nanomuse: own clips: adopted %d clip(s) from the relay', adopted)
+    return adopted
+  }
+
+
+
   private readonly handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     const route = url.pathname.slice(API_PREFIX.length) || '/'
@@ -4511,6 +4614,7 @@ export default class NanomuseCloud extends Service {
         if (body.mood != null && !isOwnClipMood(body.mood)) return send(res, 400, { error: { code: 'bad_mood', message: 'Unknown avatar mood' } })
         const poster = typeof body.poster === 'string' && body.poster ? Buffer.from(body.poster, 'base64') : undefined
         if (!(await this.ownClip.use(poster, body.mood as OwnClipMood | undefined))) return send(res, 409, { error: { code: 'no_pending', message: 'No clip waiting to be used' } })
+        this.shareOwnClips().catch(() => undefined)
         return send(res, 200, { ownClip: this.ownClip.view() })
       }
       if (req.method === 'POST' && route === '/own-clip/discard') {
@@ -4521,6 +4625,7 @@ export default class NanomuseCloud extends Service {
         const body: Record<string, unknown> = await json(req).catch(() => ({}))
         if (body.mood != null && !isOwnClipMood(body.mood)) return send(res, 400, { error: { code: 'bad_mood', message: 'Unknown avatar mood' } })
         await this.ownClip.clear(body.mood as OwnClipMood | undefined)
+        this.shareOwnClips().catch(() => undefined)
         return send(res, 204)
       }
       // Settings → Computer use: the runtime and the "try it" checks (desk-b)

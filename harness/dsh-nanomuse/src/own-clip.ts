@@ -197,6 +197,16 @@ export class OwnClip {
     return join(this.deps.dir, 'own-clip.pending.mp4')
   }
 
+  /** The mood's clip file path (the caller checks the mood is one of `OWN_CLIP_MOODS`). */
+  moodClipFile(mood: OwnClipMood): string {
+    return this.moodFile(mood, 'mp4')
+  }
+
+  /** The mood's first-frame path. */
+  moodPosterFile(mood: OwnClipMood): string {
+    return this.moodFile(mood, 'png')
+  }
+
   private moodFile(mood: OwnClipMood, extension: 'mp4' | 'png'): string {
     return join(this.deps.dir, `own-clip-${mood}.${extension}`)
   }
